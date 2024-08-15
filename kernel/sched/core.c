@@ -25,6 +25,8 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
 
+
+
 /*
  * Export tracepoints that act as a bare tracehook (ie: have no trace event
  * associated with them) to allow external modules to probe them.
@@ -4001,111 +4003,118 @@ restart:
  *
  * WARNING: must be called with preemption disabled!
  */
+
+//  获取当前任务的上下文切换次数
+static inline int get_context_switches(struct task_struct *task) {
+    return task->nvcsw + task->nivcsw;
+}
+
+//  估算当前CPU的使用率
+static inline int get_cpu_usage(void) {
+    struct rq *rq = this_rq();  // 获取当前CPU的运行队列
+    u64 idle_time = rq->idle_stamp;  // 获取CPU空闲时间戳
+    u64 total_time = rq->clock_task;  // 获取CPU任务时间戳
+
+    // 防止除零错误
+    if (total_time == 0)
+        return 0;
+
+    // 计算CPU使用率百分比
+    return 100 * (total_time - idle_time) / total_time;
+}
+
+
+
+//  这是自适应策略调整函数，它根据CPU使用率和上下文切换次数来动态调整调度策略。
+void monitor_and_adjust_policy(struct cfs_rq *cfs_rq) {
+    int cpu_usage = get_cpu_usage();  // 获取CPU使用率
+    int ctx_switches = get_context_switches(current); // 获取当前任务的上下文切换次数
+
+    // 获取当前任务组
+    struct task_group *tg = cfs_rq->tg;
+
+    if (cpu_usage > 70 && ctx_switches > 1000) {
+        tg->real_policy = SCHED_NORMAL; // 将调度策略设置为CFS
+    } else if (cpu_usage < 50 && ctx_switches < 500) {
+        tg->real_policy = SCHED_FIFO; // 将调度策略设置为FIFO
+    }
+}
+
+
 static void __sched notrace __schedule(bool preempt)
 {
-	struct task_struct *prev, *next;
-	unsigned long *switch_count;
-	struct rq_flags rf;
-	struct rq *rq;
-	int cpu;
+    struct task_struct *prev, *next;
+    unsigned long *switch_count;
+    struct rq_flags rf;
+    struct rq *rq;
+    int cpu;
 
-	/*
-	 * If the task is using ASI then exit it right away otherwise the
-	 * ASI will likely quickly fault, for example when accessing run
-	 * queues.
-	 */
-	if (IS_ENABLED(CONFIG_ADDRESS_SPACE_ISOLATION))
-		asi_schedule_out(current);
+    if (IS_ENABLED(CONFIG_ADDRESS_SPACE_ISOLATION))
+        asi_schedule_out(current);
 
-	cpu = smp_processor_id();
-	rq = cpu_rq(cpu);
-	prev = rq->curr;
+    cpu = smp_processor_id();
+    rq = cpu_rq(cpu);
+    prev = rq->curr;
 
-	schedule_debug(prev, preempt);
+    schedule_debug(prev, preempt);
 
-	if (sched_feat(HRTICK))
-		hrtick_clear(rq);
+    if (sched_feat(HRTICK))
+        hrtick_clear(rq);
 
-	local_irq_disable();
-	rcu_note_context_switch(preempt);
+    local_irq_disable();
+    rcu_note_context_switch(preempt);
 
-	/*
-	 * Make sure that signal_pending_state()->signal_pending() below
-	 * can't be reordered with __set_current_state(TASK_INTERRUPTIBLE)
-	 * done by the caller to avoid the race with signal_wake_up().
-	 *
-	 * The membarrier system call requires a full memory barrier
-	 * after coming from user-space, before storing to rq->curr.
-	 */
-	rq_lock(rq, &rf);
-	smp_mb__after_spinlock();
+    rq_lock(rq, &rf);
+    smp_mb__after_spinlock();
 
-	/* Promote REQ to ACT */
-	rq->clock_update_flags <<= 1;
-	update_rq_clock(rq);
+    rq->clock_update_flags <<= 1;
+    update_rq_clock(rq);
 
-	switch_count = &prev->nivcsw;
-	if (!preempt && prev->state) {
-		if (signal_pending_state(prev->state, prev)) {
-			prev->state = TASK_RUNNING;
-		} else {
-			deactivate_task(rq, prev, DEQUEUE_SLEEP | DEQUEUE_NOCLOCK);
+    switch_count = &prev->nivcsw;
+    if (!preempt && prev->state) {
+        if (signal_pending_state(prev->state, prev)) {
+            prev->state = TASK_RUNNING;
+        } else {
+            deactivate_task(rq, prev, DEQUEUE_SLEEP | DEQUEUE_NOCLOCK);
 
-			if (prev->in_iowait) {
-				atomic_inc(&rq->nr_iowait);
-				delayacct_blkio_start();
-			}
-		}
-		switch_count = &prev->nvcsw;
-	}
+            if (prev->in_iowait) {
+                atomic_inc(&rq->nr_iowait);
+                delayacct_blkio_start();
+            }
+        }
+        switch_count = &prev->nvcsw;
+    }
 
-	next = pick_next_task(rq, prev, &rf);
-	clear_tsk_need_resched(prev);
-	clear_preempt_need_resched();
+    // 插入自适应调度策略函数调用
+    monitor_and_adjust_policy(&rq->cfs);
 
-	if (likely(prev != next)) {
-		rq->nr_switches++;
-		/*
-		 * RCU users of rcu_dereference(rq->curr) may not see
-		 * changes to task_struct made by pick_next_task().
-		 */
-		RCU_INIT_POINTER(rq->curr, next);
-		/*
-		 * The membarrier system call requires each architecture
-		 * to have a full memory barrier after updating
-		 * rq->curr, before returning to user-space.
-		 *
-		 * Here are the schemes providing that barrier on the
-		 * various architectures:
-		 * - mm ? switch_mm() : mmdrop() for x86, s390, sparc, PowerPC.
-		 *   switch_mm() rely on membarrier_arch_switch_mm() on PowerPC.
-		 * - finish_lock_switch() for weakly-ordered
-		 *   architectures where spin_unlock is a full barrier,
-		 * - switch_to() for arm64 (weakly-ordered, spin_unlock
-		 *   is a RELEASE barrier),
-		 */
-		++*switch_count;
+    next = pick_next_task(rq, prev, &rf);
+    clear_tsk_need_resched(prev);
+    clear_preempt_need_resched();
 
-		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
+    if (likely(prev != next)) {
+        rq->nr_switches++;
 
-		trace_sched_switch(preempt, prev, next);
+        RCU_INIT_POINTER(rq->curr, next);
 
-		/* Also unlocks the rq: */
-		rq = context_switch(rq, prev, next, &rf);
-	} else {
-		rq->clock_update_flags &= ~(RQCF_ACT_SKIP|RQCF_REQ_SKIP);
-		rq_unlock_irq(rq, &rf);
-	}
+        ++*switch_count;
 
-	balance_callback(rq);
+        psi_sched_switch(prev, next, !task_on_rq_queued(prev));
 
-	/*
-	 * Now the task will resume execution, we can safely return to
-	 * its ASI if one was in used.
-	 */
-	if (IS_ENABLED(CONFIG_ADDRESS_SPACE_ISOLATION))
-		asi_schedule_in(current);
+        trace_sched_switch(preempt, prev, next);
+
+        rq = context_switch(rq, prev, next, &rf);  // 任务切换
+    } else {
+        rq->clock_update_flags &= ~(RQCF_ACT_SKIP|RQCF_REQ_SKIP);
+        rq_unlock_irq(rq, &rf);
+    }
+
+    balance_callback(rq);
+
+    if (IS_ENABLED(CONFIG_ADDRESS_SPACE_ISOLATION))
+        asi_schedule_in(current);
 }
+
 
 void __noreturn do_task_dead(void)
 {
