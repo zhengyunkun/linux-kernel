@@ -4004,6 +4004,8 @@ restart:
  * WARNING: must be called with preemption disabled!
  */
 
+#define MONITOR_INTERVAL 100  // 设置监测周期为100次调度
+
 //  获取当前任务的上下文切换次数
 static inline int get_context_switches(struct task_struct *task) {
     return task->nvcsw + task->nivcsw;
@@ -4085,8 +4087,14 @@ static void __sched notrace __schedule(bool preempt)
         switch_count = &prev->nvcsw;
     }
 
-    // 插入自适应调度策略函数调用
-    monitor_and_adjust_policy(&rq->cfs);
+    // 调度计数器增加
+    rq->sched_count++;
+
+    // 检测周期内只调用一次 monitor_and_adjust_policy
+    if (rq->sched_count >= MONITOR_INTERVAL) {
+        monitor_and_adjust_policy(&rq->cfs);
+        rq->sched_count = 0;  // 重置计数器
+    }
 
     next = pick_next_task(rq, prev, &rf);
     clear_tsk_need_resched(prev);
